@@ -6,9 +6,10 @@ Das System besteht aus vier klar getrennten Schichten:
 
 ```
 [Telegram] → [Assistent (vorhanden)] → [Python-Sync-Service]
-                                               ↕ REST/HTTP
+                                               ↕ REST/HTTP (Polling)
                                        [Middleware-Server]
-                                               ↕ WebSocket/SSE
+                                         (Proxmox VPS / OpenClaw)
+                                               ↕ WebSocket
                                        [Web-Dashboard]
                                                ↕ Plugin-Routing
                                    [Todoist / Google Calendar / ...]
@@ -21,16 +22,29 @@ Alle folgenden Komponenten werden neu entwickelt.
 
 ## 2. Technologie-Entscheidungen
 
-| Komponente         | Technologie                        | Begründung                                      |
-|--------------------|------------------------------------|-------------------------------------------------|
-| Datenbank          | PostgreSQL                         | JSON-Support, robust, gut skalierbar            |
-| Middleware/API     | Python (FastAPI)                   | async-fähig, einfache REST+WebSocket-Unterstützung |
-| Echtzeit           | WebSockets (via FastAPI)           | bidirektional, kein Polling nötig               |
-| Web-Dashboard      | Next.js (React) + Tailwind CSS     | mobiloptimiert, SSR, modernes UI                |
-| Authentifizierung  | JWT (Access + Refresh Token)       | stateless, sicher, Session-fähig                |
-| Python-Sync        | Python (aiohttp + SQLAlchemy)      | async HTTP + ORM für SQL                        |
-| API-Kommunikation  | REST (JSON) + Bearer Token         | standardisiert, erweiterbar                     |
-| Plugin-System      | abstrakte Basisklasse in Python    | einheitliche Schnittstelle für alle Plugins     |
+| Komponente         | Technologie                        | Begründung                                           |
+|--------------------|------------------------------------|------------------------------------------------------|
+| Datenbank          | MariaDB (MySQL)                    | auf VPS bereits verfügbar, gut unterstützt           |
+| Middleware/API     | Python (FastAPI)                   | async-fähig, REST + WebSocket in einem               |
+| Echtzeit           | WebSockets (via FastAPI)           | bidirektional, kein Polling im Dashboard nötig       |
+| Web-Dashboard      | Next.js (React) + Tailwind CSS     | mobiloptimiert, modernes UI                          |
+| Authentifizierung  | JWT (Access + Refresh Token)       | stateless, sicher, Session-fähig, Einzelnutzer       |
+| Python-Sync        | Python (aiohttp + SQLAlchemy)      | async HTTP + ORM, MariaDB-kompatibel                 |
+| API-Kommunikation  | REST (JSON) + Bearer Token         | standardisiert, erweiterbar                          |
+| Sync-Strategie     | **Polling** (30 Sek. Intervall)    | Assistent-Server muss nicht öffentlich erreichbar sein|
+| Plugin-System      | abstrakte Basisklasse in Python    | einheitliche Schnittstelle für alle Plugins          |
+| Server             | Proxmox VPS mit OpenClaw           | vorhandene Infrastruktur                             |
+
+### Warum Polling statt Webhooks
+Der Python-Sync-Service läuft lokal auf dem Assistent-Server. Dieser ist
+nicht zwingend öffentlich erreichbar – Webhooks würden eine eingehende
+Verbindung vom Middleware-Server erfordern. Mit Polling fragt der Sync-Service
+aktiv alle 30 Sekunden bei der Middleware nach Änderungen. Einfacher,
+robuster, kein Port-Forwarding nötig.
+
+### Einzelnutzer-System
+Kein Multi-Tenancy. Kein Rollen- oder Rechtesystem in Phase 1–3.
+Ein fester Admin-Account, JWT-gesichert.
 
 ---
 
@@ -38,11 +52,11 @@ Alle folgenden Komponenten werden neu entwickelt.
 
 ```
 /
-├── middleware/                  # FastAPI-Backend (Middleware-Server)
+├── middleware/                  # FastAPI-Backend (auf Proxmox VPS)
 │   ├── app/
 │   │   ├── main.py              # App-Einstieg, Router-Registrierung
 │   │   ├── config.py            # Umgebungsvariablen
-│   │   ├── database.py          # DB-Verbindung, Session
+│   │   ├── database.py          # MariaDB-Verbindung via SQLAlchemy
 │   │   ├── models/              # SQLAlchemy-Modelle
 │   │   │   ├── todo.py
 │   │   │   ├── event.py
@@ -75,10 +89,10 @@ Alle folgenden Komponenten werden neu entwickelt.
 │
 ├── sync-backend/                # Python-Sync-Service (auf Assistent-Server)
 │   ├── sync/
-│   │   ├── main.py              # Einstieg, Scheduler
+│   │   ├── main.py              # Einstieg, Polling-Scheduler
 │   │   ├── receiver.py          # Empfang strukturierter Daten vom Assistenten
-│   │   ├── db.py                # lokale SQLite/PostgreSQL-Verbindung
-│   │   ├── middleware_client.py # HTTP-Client zur Middleware
+│   │   ├── db.py                # lokale SQLite-Pufferdatenbank
+│   │   ├── middleware_client.py # HTTP-Client zur Middleware (mit Retry)
 │   │   └── logger.py            # Sync-Logging
 │   ├── requirements.txt
 │   └── .env.example
@@ -86,7 +100,7 @@ Alle folgenden Komponenten werden neu entwickelt.
 ├── dashboard/                   # Next.js Web-Dashboard
 │   ├── app/
 │   │   ├── page.tsx             # Startseite / Übersicht
-│   │   ├── login/page.tsx       # Login
+│   │   ├── login/page.tsx
 │   │   ├── todos/page.tsx
 │   │   ├── events/page.tsx
 │   │   ├── ideas/page.tsx
@@ -98,7 +112,7 @@ Alle folgenden Komponenten werden neu entwickelt.
 │   │   ├── ShoppingList.tsx
 │   │   └── RealTimeProvider.tsx  # WebSocket-Kontext
 │   ├── lib/
-│   │   ├── api.ts               # Axios/Fetch-Client
+│   │   ├── api.ts               # Fetch-Client
 │   │   └── auth.ts              # Token-Verwaltung
 │   ├── tailwind.config.ts
 │   └── package.json
@@ -109,121 +123,132 @@ Alle folgenden Komponenten werden neu entwickelt.
 
 ---
 
-## 4. Datenbank-Schema (PostgreSQL)
+## 4. Datenbank-Schema (MariaDB / MySQL)
+
+> Hinweis: MariaDB 10.7+ unterstützt `UUID()` als Defaultwert.
+> Bei älteren Versionen werden UUIDs im Anwendungscode generiert (Python `uuid.uuid4()`).
+> `JSONB` gibt es nicht in MariaDB – wird durch `JSON` ersetzt.
+> Arrays (`TEXT[]`) gibt es nicht – Tags werden als `JSON`-Feld gespeichert.
 
 ### ideas
 ```sql
 CREATE TABLE ideas (
-    id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    id          CHAR(36) PRIMARY KEY,
     title       TEXT NOT NULL,
     content     TEXT,
-    tags        TEXT[],
+    tags        JSON,
     source      VARCHAR(20) DEFAULT 'telegram',  -- telegram | manual | audio
     status      VARCHAR(20) DEFAULT 'active',    -- active | archived
-    created_at  TIMESTAMPTZ DEFAULT NOW(),
-    updated_at  TIMESTAMPTZ DEFAULT NOW()
-);
+    created_at  DATETIME DEFAULT CURRENT_TIMESTAMP,
+    updated_at  DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 ```
 
 ### todos
 ```sql
 CREATE TABLE todos (
-    id                UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    id                CHAR(36) PRIMARY KEY,
     title             TEXT NOT NULL,
     description       TEXT,
-    due_date          TIMESTAMPTZ,
-    priority          SMALLINT DEFAULT 2,         -- 1=hoch, 2=mittel, 3=niedrig
+    due_date          DATETIME,
+    priority          TINYINT DEFAULT 2,           -- 1=hoch, 2=mittel, 3=niedrig
     completed         BOOLEAN DEFAULT FALSE,
-    external_provider VARCHAR(50),                -- todoist | null
+    external_provider VARCHAR(50),                 -- todoist | NULL
     external_id       VARCHAR(100),
-    created_at        TIMESTAMPTZ DEFAULT NOW(),
-    updated_at        TIMESTAMPTZ DEFAULT NOW()
-);
+    created_at        DATETIME DEFAULT CURRENT_TIMESTAMP,
+    updated_at        DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 ```
 
 ### events
 ```sql
 CREATE TABLE events (
-    id                UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    id                CHAR(36) PRIMARY KEY,
     title             TEXT NOT NULL,
-    start_time        TIMESTAMPTZ NOT NULL,
-    end_time          TIMESTAMPTZ,
+    start_time        DATETIME NOT NULL,
+    end_time          DATETIME,
     location          TEXT,
     description       TEXT,
-    reminder_offset   INTEGER,                    -- Minuten vor dem Termin
-    external_provider VARCHAR(50),                -- google_calendar | null
+    reminder_offset   INT,                         -- Minuten vor dem Termin
+    external_provider VARCHAR(50),                 -- google_calendar | NULL
     external_id       VARCHAR(100),
-    created_at        TIMESTAMPTZ DEFAULT NOW(),
-    updated_at        TIMESTAMPTZ DEFAULT NOW()
-);
+    created_at        DATETIME DEFAULT CURRENT_TIMESTAMP,
+    updated_at        DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 ```
 
 ### shopping_items
 ```sql
 CREATE TABLE shopping_items (
-    id           UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    id           CHAR(36) PRIMARY KEY,
     title        TEXT NOT NULL,
     category     VARCHAR(100),
-    quantity     NUMERIC,
+    quantity     DECIMAL(10,2),
     unit         VARCHAR(30),
     checked      BOOLEAN DEFAULT FALSE,
     store_name   TEXT,
-    price        NUMERIC(10,2),
-    created_at   TIMESTAMPTZ DEFAULT NOW(),
-    updated_at   TIMESTAMPTZ DEFAULT NOW()
-);
+    price        DECIMAL(10,2),
+    created_at   DATETIME DEFAULT CURRENT_TIMESTAMP,
+    updated_at   DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 ```
 
 ### reminders
 ```sql
 CREATE TABLE reminders (
-    id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    id          CHAR(36) PRIMARY KEY,
     type        VARCHAR(50) NOT NULL,
-    target_ref  UUID,
-    remind_at   TIMESTAMPTZ NOT NULL,
+    target_ref  CHAR(36),
+    remind_at   DATETIME NOT NULL,
     channel     VARCHAR(30) DEFAULT 'telegram',
     sent        BOOLEAN DEFAULT FALSE,
-    created_at  TIMESTAMPTZ DEFAULT NOW()
-);
+    created_at  DATETIME DEFAULT CURRENT_TIMESTAMP
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 ```
 
 ### integrations
 ```sql
 CREATE TABLE integrations (
-    id             UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    id             CHAR(36) PRIMARY KEY,
     provider_name  VARCHAR(50) UNIQUE NOT NULL,
     enabled        BOOLEAN DEFAULT FALSE,
-    config_json    JSONB,
-    last_sync_at   TIMESTAMPTZ
-);
+    config_json    JSON,
+    last_sync_at   DATETIME
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 ```
 
 ### sync_jobs
 ```sql
 CREATE TABLE sync_jobs (
-    id             UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    id             CHAR(36) PRIMARY KEY,
     provider_name  VARCHAR(50) NOT NULL,
     object_type    VARCHAR(50) NOT NULL,
-    object_id      UUID NOT NULL,
-    action         VARCHAR(20) NOT NULL,          -- create | update | delete
-    status         VARCHAR(20) DEFAULT 'pending', -- pending | success | failed
+    object_id      CHAR(36) NOT NULL,
+    action         VARCHAR(20) NOT NULL,           -- create | update | delete
+    status         VARCHAR(20) DEFAULT 'pending',  -- pending | success | failed
     error_message  TEXT,
-    created_at     TIMESTAMPTZ DEFAULT NOW(),
-    updated_at     TIMESTAMPTZ DEFAULT NOW()
-);
+    created_at     DATETIME DEFAULT CURRENT_TIMESTAMP,
+    updated_at     DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 ```
 
 ### audit_log
 ```sql
 CREATE TABLE audit_log (
-    id           UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    id           CHAR(36) PRIMARY KEY,
     actor        VARCHAR(100),
     action       VARCHAR(50) NOT NULL,
     entity_type  VARCHAR(50),
-    entity_id    UUID,
-    payload_json JSONB,
-    created_at   TIMESTAMPTZ DEFAULT NOW()
-);
+    entity_id    CHAR(36),
+    payload_json JSON,
+    created_at   DATETIME DEFAULT CURRENT_TIMESTAMP
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+```
+
+### SQLAlchemy-Verbindung (MariaDB)
+```python
+# DATABASE_URL in .env
+DATABASE_URL=mysql+pymysql://user:password@localhost:3306/assistant_db
 ```
 
 ---
@@ -268,15 +293,15 @@ PATCH  /plugins/{provider_name}  → Plugin aktivieren/deaktivieren
 GET    /sync-jobs                → Sync-Historie
 ```
 
-### WebSocket (Echtzeit)
+### WebSocket (Echtzeit – Dashboard)
 ```
 WS /ws?token=<access_token>
 ```
 Events vom Server an den Client:
 ```json
-{ "event": "todo.updated",  "data": { ...todo } }
-{ "event": "todo.created",  "data": { ...todo } }
-{ "event": "event.created", "data": { ...event } }
+{ "event": "todo.updated",     "data": { ...todo } }
+{ "event": "todo.created",     "data": { ...todo } }
+{ "event": "event.created",    "data": { ...event } }
 { "event": "shopping.checked", "data": { ...item } }
 ```
 
@@ -285,7 +310,7 @@ Events vom Server an den Client:
 ## 6. Assistent → Sync-Backend Interface
 
 Der Assistent übergibt strukturierte Daten lokal an den Sync-Service.
-Empfohlene Methode: **HTTP POST auf localhost** (einfach, entkoppelt).
+Methode: **HTTP POST auf localhost** (einfach, kein Netzwerk-Exposure).
 
 ```
 POST http://localhost:8001/ingest
@@ -295,16 +320,39 @@ Content-Type: application/json
 
 Payload-Beispiele:
 ```json
-{ "type": "todo",  "data": { "title": "Zahnarzt anrufen", "due_date": "2026-04-10" } }
-{ "type": "idea",  "data": { "title": "App-Idee", "content": "...", "source": "audio" } }
-{ "type": "event", "data": { "title": "Meeting", "start_time": "2026-04-05T14:00:00Z" } }
+{ "type": "todo",          "data": { "title": "Zahnarzt anrufen", "due_date": "2026-04-10" } }
+{ "type": "idea",          "data": { "title": "App-Idee", "content": "...", "source": "audio" } }
+{ "type": "event",         "data": { "title": "Meeting", "start_time": "2026-04-05T14:00:00Z" } }
 { "type": "shopping_item", "data": { "title": "Milch", "quantity": 2, "unit": "l" } }
-{ "type": "reminder", "data": { "target_ref": "<uuid>", "remind_at": "...", "channel": "telegram" } }
+{ "type": "reminder",      "data": { "target_ref": "<uuid>", "remind_at": "...", "channel": "telegram" } }
 ```
 
 ---
 
-## 7. Plugin-System
+## 7. Sync-Strategie (Polling)
+
+```
+Sync-Service (lokal)          Middleware-Server (VPS)
+      │                               │
+      │── POST /ingest ──────────────►│  neue Daten senden
+      │                               │
+      │── GET /changes?since=<ts> ───►│  Änderungen abholen
+      │◄── [ { id, type, data } ] ───│
+      │                               │
+      │  (lokal aktualisieren)        │
+      │                               │
+      │  (alle 30 Sek. wiederholen)   │
+```
+
+- Der Sync-Service speichert einen `last_sync_at`-Timestamp lokal.
+- Die Middleware stellt einen `/changes`-Endpunkt bereit, der alle seit
+  `last_sync_at` geänderten Objekte zurückgibt.
+- Bei Verbindungsfehlern: exponential backoff (5s, 10s, 20s, max 5 Min).
+- Lokale SQLite dient als Puffer bei Offline-Phasen.
+
+---
+
+## 8. Plugin-System
 
 ### Abstrakte Basisklasse
 ```python
@@ -338,11 +386,11 @@ class AbstractPlugin(ABC):
 
 Jedes neue Plugin implementiert `AbstractPlugin` und registriert sich
 in einer zentralen Plugin-Registry. Konfiguration (API-Keys etc.) wird
-verschlüsselt in `integrations.config_json` gespeichert.
+AES-verschlüsselt in `integrations.config_json` gespeichert.
 
 ---
 
-## 8. Dashboard – Kernansichten
+## 9. Dashboard – Kernansichten
 
 ### Startseite
 - Offene Todos (heute + überfällig)
@@ -356,91 +404,110 @@ verschlüsselt in `integrations.config_json` gespeichert.
 - Swipe-to-complete für Todos und Einkaufsartikel
 - Karten-Layout statt Tabellen
 - Bottom Navigation (4 Icons: Übersicht / Todos / Kalender / Mehr)
-- Dunkelmodus über `prefers-color-scheme` + manuellem Toggle
+- Dunkelmodus via `prefers-color-scheme` + manuellem Toggle
 
 ### Echtzeit
 `RealTimeProvider.tsx` hält eine WebSocket-Verbindung und aktualisiert
-den globalen State (Zustand via Zustand/Jotai) ohne Seiten-Reload.
+den globalen State ohne Seiten-Reload.
 
 ---
 
-## 9. Sicherheit
+## 10. Sicherheit
 
 | Aspekt                    | Maßnahme                                           |
 |---------------------------|----------------------------------------------------|
-| API-Zugang                | JWT Bearer Token (kurze Laufzeit: 15 Min)          |
-| Session-Verlängerung      | Refresh Token (7 Tage, rotation bei Nutzung)       |
+| API-Zugang                | JWT Bearer Token (Laufzeit: 15 Min)                |
+| Session-Verlängerung      | Refresh Token (7 Tage, Rotation bei Nutzung)       |
 | Passwortschutz Dashboard  | Login-Seite + httpOnly Cookie für Refresh Token    |
 | Assistent → Sync          | statischer lokaler API-Key (Umgebungsvariable)     |
-| Sync → Middleware         | JWT-Token mit eigener Rolle (`sync-service`)       |
+| Sync → Middleware         | JWT-Token mit Rolle `sync-service`                 |
 | Plugin-Credentials        | AES-verschlüsselt in `config_json`                 |
-| HTTPS                     | TLS via Reverse Proxy (nginx + Let's Encrypt)      |
+| HTTPS                     | TLS via Reverse Proxy (nginx / OpenClaw + Let's Encrypt) |
+| Einzelnutzer              | kein Multi-Tenancy, ein Admin-Account              |
 
 ---
 
-## 10. Umsetzungsplan (Phasen)
+## 11. Deployment (Proxmox VPS / OpenClaw)
+
+```
+VPS (OpenClaw)
+├── MariaDB                         # bereits auf dem Server
+├── Python (FastAPI via uvicorn)    # als systemd-Service oder Docker
+├── Next.js (Node.js)               # als systemd-Service oder Docker
+└── Reverse Proxy (nginx / OLS)
+    ├── /api/*   → FastAPI (Port 8000)
+    ├── /ws      → FastAPI WebSocket (Port 8000)
+    └── /*       → Next.js (Port 3000)
+```
+
+- HTTPS über Let's Encrypt (OpenClaw hat i.d.R. SSL-Verwaltung integriert)
+- FastAPI läuft als `uvicorn middleware.app.main:app --host 127.0.0.1 --port 8000`
+- Alembic-Migrationen werden beim Deployment ausgeführt
+
+---
+
+## 12. Umsetzungsplan (Phasen)
 
 ### Phase 1 – Fundament (Middleware + Dashboard)
-1. PostgreSQL-Schema anlegen + Alembic-Migrationen einrichten
+1. MariaDB-Datenbank anlegen + Alembic-Migrationen einrichten
 2. FastAPI-Middleware aufbauen:
    - Auth (Login, JWT, Refresh)
    - CRUD-Endpunkte für alle Kernobjekte
    - WebSocket-Manager
+   - `/changes`-Endpunkt für Polling
 3. Next.js-Dashboard:
    - Login
    - Übersichtsseite
    - Todo-, Kalender-, Einkaufs-, Ideen-Ansicht
    - WebSocket-Integration
-4. Deployment: Docker Compose (Middleware + PostgreSQL + Dashboard)
+4. Deployment auf VPS einrichten
 
 ### Phase 2 – Sync-Backend
 1. Python-Sync-Service aufbauen (`/ingest`-Endpoint)
 2. Lokale SQLite für Offline-Pufferung
-3. HTTP-Client zur Middleware (mit Retry-Logik)
-4. Bidirektionaler Sync (Statusänderungen vom Dashboard zurückholen)
-5. Scheduler für periodischen Sync (z. B. alle 30 Sekunden)
+3. HTTP-Client zur Middleware (mit exponential backoff)
+4. Polling-Scheduler (30 Sek.) für bidirektionalen Sync
+5. Statusänderungen vom Dashboard zurückholen + lokal anwenden
 
 ### Phase 3 – Plugins
 1. Todoist-Plugin implementieren
 2. Google-Calendar-Plugin implementieren
 3. Reminder-Dispatcher (sendet Erinnerungen via Telegram zurück)
-4. Plugin-Status im Dashboard anzeigen
-5. Sync-Log im Dashboard
+4. Plugin-Status und Sync-Log im Dashboard
 
 ### Phase 4 – Erweiterungen
-1. Volltextsuche (PostgreSQL `tsvector`)
+1. Volltextsuche (MariaDB `FULLTEXT INDEX`)
 2. Filter + Tags im Dashboard
 3. Export (CSV / JSON)
-4. Mehrere Profile / Haushalte
-5. KI-basierte Klassifikation und Vorschläge
-6. Weitere Plugins nach Bedarf
+4. KI-basierte Klassifikation und Vorschläge
+5. Weitere Plugins nach Bedarf
 
 ---
 
-## 11. Offene Entscheidungen (Klärungsbedarf)
+## 13. Getroffene Entscheidungen (Zusammenfassung)
 
-| Frage                                      | Empfehlung / Optionen                              |
-|--------------------------------------------|----------------------------------------------------|
-| Wo läuft der Middleware-Server?            | VPS (z. B. Hetzner), Docker Compose                |
-| Lokale DB im Sync-Backend                  | SQLite (einfach) oder PostgreSQL (konsistent)      |
-| Webhook vs. Polling für Sync               | Polling (einfacher) → später auf Webhooks migrieren|
-| Konfliktlösung bei gleichzeitigen Updates  | Server-wins-Strategie + Audit-Log                  |
-| Anzahl Nutzer                              | Einzelnutzer → kein Multi-Tenancy nötig (Phase 1)  |
-| Wie authentifiziert sich der Assistent?    | Lokaler API-Key (Umgebungsvariable im Sync-Service)|
+| Frage                                      | Entscheidung                                        |
+|--------------------------------------------|-----------------------------------------------------|
+| Datenbank                                  | MariaDB (MySQL) – auf VPS vorhanden                 |
+| Server-Infrastruktur                       | Proxmox VPS mit OpenClaw                            |
+| Webhook vs. Polling                        | **Polling** (30 Sek.) – kein öffentlicher Endpoint nötig |
+| Konfliktlösung bei gleichzeitigen Updates  | Server-wins + Audit-Log                             |
+| Anzahl Nutzer                              | **Einzelnutzer** – kein Multi-Tenancy               |
+| Assistent-Authentifizierung                | lokaler API-Key (Umgebungsvariable im Sync-Service) |
+| Lokale Pufferdatenbank                     | SQLite (einfach, kein extra Dienst)                 |
 
 ---
 
-## 12. Fazit
+## 14. Fazit
 
-Das Konzept setzt die in `assist.md` beschriebene Architektur mit konkreten
-Technologieentscheidungen um:
+Das System nutzt die vorhandene Infrastruktur (Proxmox VPS, OpenClaw, MariaDB)
+und ergänzt sie mit:
 
-- **FastAPI** als schnelle, async-fähige Middleware mit WebSocket-Support
-- **PostgreSQL** als robuste, erweiterbare Datenbank
-- **Next.js + Tailwind** für ein modernes, mobiloptimiertes Dashboard
-- **Plugin-Basisklasse** für standardisierte Drittanbieter-Anbindung
-- **JWT + Refresh Token** für sicheren, sessionfähigen Zugang
-- **Phasenweise Umsetzung** für kontrollierten, erweiterbaren Aufbau
+- **FastAPI** als Middleware (async, REST + WebSocket)
+- **MariaDB** als zentrale Datenbank (MySQL-kompatibel, kein Extra-Setup)
+- **Next.js + Tailwind** für das mobile Dashboard
+- **Polling** für den lokalen Sync (robust, keine Firewall-Anforderungen)
+- **Plugin-Basisklasse** für saubere Drittanbieter-Anbindung
+- **JWT + Einzelnutzer** für einfaches, sicheres Auth
 
-Der vorhandene Assistent bleibt vollständig unangetastet und übergibt
-lediglich strukturierte Daten an den Sync-Service.
+Der vorhandene Assistent bleibt vollständig unangetastet.
