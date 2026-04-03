@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from sqlalchemy import Column, String, Text, DateTime
+from sqlalchemy import Column, Integer, String, Text, DateTime
 
 from app.database import Base
 
@@ -14,7 +14,7 @@ class Event(Base):
     end_time = Column(DateTime, nullable=True)
     location = Column(Text, nullable=True)
     description = Column(Text, nullable=True)
-    reminder_offset = Column(String(36), nullable=True)
+    reminder_offset = Column(Integer, nullable=True)
     external_provider = Column(String(50), nullable=True)
     external_id = Column(String(100), nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
