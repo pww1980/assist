@@ -3,37 +3,49 @@
 ## 1. Überblick & Server-Aufteilung
 
 ```
-┌──────────────────────────────────────┐        ┌──────────────────────────────────┐
-│         Proxmox VPS                  │        │           YunoHost               │
-│                                      │        │                                  │
-│  [Telegram]                          │  HTTPS │  ┌────────────────────────────┐  │
-│      ↓                               │ ──────►│  │  FastAPI Middleware         │  │
-│  [OpenClaw]  ← vorhandener Assistent │        │  │  (REST + WebSocket)         │  │
-│      ↓  (lokale Übergabe)            │◄───────│  └──────────┬─────────────────┘  │
-│  [Python Sync Service]               │        │             │ SQL                │  │
-│      │  POST /ingest (HTTPS)         │        │  ┌──────────▼─────────────────┐  │
-│      └──────────────────────────────►│        │  │  MariaDB                   │  │
-│                                      │        │  └──────────┬─────────────────┘  │
-└──────────────────────────────────────┘        │             │                    │
-                                                │  ┌──────────▼─────────────────┐  │
-                                                │  │  Next.js Dashboard          │  │
-                                                │  │  (mobiloptimiert)           │  │
-                                                │  └────────────────────────────┘  │
-                                                │  nginx (Reverse Proxy + SSL)     │
-                                                └──────────────────────────────────┘
-                                                          ↕ Plugin-Routing
-                                              [Todoist / Google Calendar / ...]
+┌──────────────────────────────────────────────┐     ┌──────────────────────────────────┐
+│               Proxmox VPS                    │     │           YunoHost               │
+│                                              │     │                                  │
+│  [Telegram]                                  │     │  ┌────────────────────────────┐  │
+│      ↓                                       │     │  │  FastAPI Middleware         │  │
+│  [OpenClaw]  ← vorhandener Assistent         │     │  │  (REST + WebSocket)         │  │
+│      ↓  ruft Python direkt auf               │     │  └──────────┬─────────────────┘  │
+│  [Python Script / Modul]                     │     │             │ SQL                │  │
+│      │                                       │     │  ┌──────────▼─────────────────┐  │
+│      │  HTTPS Schreiben: POST /api/todos     │─────►  │  MariaDB                   │  │
+│      │  HTTPS Lesen:     GET  /api/todos     │◄────│  └──────────┬─────────────────┘  │
+│      │  → Antwort zurück an OpenClaw         │     │             │                    │
+│                                              │     │  ┌──────────▼─────────────────┐  │
+└──────────────────────────────────────────────┘     │  │  Next.js Dashboard          │  │
+                                                     │  │  (mobiloptimiert, Echtzeit) │  │
+                                                     │  └────────────────────────────┘  │
+                                                     │  nginx (Reverse Proxy + SSL)     │
+                                                     └──────────────────────────────────┘
+                                                               ↕ Plugin-Routing
+                                                   [Todoist / Google Calendar / ...]
 ```
 
-**Ablauf:**
-1. Telegram-Nachricht trifft bei **OpenClaw** ein (bereits vorhanden, wird nicht geändert)
-2. OpenClaw versteht den Inhalt und übergibt strukturierte Daten lokal an den **Python Sync Service**
-3. Python sendet die Daten per HTTPS an die **FastAPI Middleware auf YunoHost**
-4. FastAPI schreibt in **MariaDB** (lokal auf YunoHost)
-5. Das **Next.js Dashboard** (auf YunoHost) zeigt die Daten in Echtzeit an
-6. Statusänderungen im Dashboard fließen zurück via FastAPI → Python holt sie per Polling ab
+**Ablauf Schreiben** (z. B. neues Todo per Sprachnachricht):
+1. Telegram-Nachricht → **OpenClaw** erkennt Typ und Inhalt
+2. OpenClaw ruft das **Python Script** direkt auf (mit strukturierten Daten)
+3. Python sendet per HTTPS an **FastAPI** auf YunoHost: `POST /api/todos`
+4. FastAPI schreibt in **MariaDB** + sendet WebSocket-Update ans Dashboard
+5. Dashboard zeigt das neue Todo sofort an
 
-**OpenClaw wird nicht verändert.** Nur der Python Sync Service wird neu gebaut.
+**Ablauf Lesen** (z. B. „Was sind meine aktuellen Todos?"):
+1. OpenClaw ruft das **Python Script** mit Lesebefehl auf
+2. Python sendet per HTTPS an **FastAPI**: `GET /api/todos?completed=false`
+3. FastAPI liest aus **MariaDB**, gibt JSON zurück
+4. Python verarbeitet die Antwort und gibt sie formatiert an **OpenClaw** zurück
+5. OpenClaw antwortet dem Nutzer mit den Daten
+
+**Vorteile dieser Architektur:**
+- Kein offener MariaDB-Port (3306) nötig – alles läuft über HTTPS
+- FastAPI ist die einzige Schnittstelle zur Datenbank (für Python UND Dashboard)
+- WebSocket-Updates ans Dashboard funktionieren automatisch bei jedem Schreibvorgang
+- Python-Script gut dokumentierbar: klare Eingaben, klare HTTP-Calls, klare Ausgaben
+
+**OpenClaw wird nicht verändert.** Nur das Python Script wird neu gebaut.
 
 ---
 
@@ -46,16 +58,26 @@
 | Echtzeit (Dashboard)    | WebSockets (via FastAPI)        | bidirektional, kein Seiten-Reload                       |
 | Web-Dashboard           | Next.js (React) + Tailwind CSS  | mobiloptimiert, modernes UI, auf YunoHost               |
 | Authentifizierung       | JWT (Access + Refresh Token)    | stateless, Einzelnutzer, sicher                         |
-| Python Sync Service     | Python (httpx + SQLAlchemy)     | auf Proxmox VPS, sendet Daten per HTTPS an FastAPI      |
-| OpenClaw → Python       | HTTP POST auf localhost          | lokale Übergabe auf Proxmox, kein Netzwerk-Exposure     |
-| Python → FastAPI        | HTTPS + Bearer Token            | öffentlich erreichbar, gesichert                        |
-| Sync-Strategie          | **Polling** (30 Sek.)           | Proxmox muss nicht öffentlich erreichbar sein           |
+| Python Script           | Python (httpx)                  | auf Proxmox, von OpenClaw aufgerufen, liest + schreibt  |
+| OpenClaw → Python       | direkter Aufruf (Subprocess)    | OpenClaw ruft Python mit Daten auf, bekommt Antwort     |
+| Python → FastAPI        | HTTPS + Bearer Token            | lesen (GET) und schreiben (POST/PATCH) via REST          |
+| Sync-Strategie          | **On-Demand** (kein Polling)    | Python wird von OpenClaw bei Bedarf aufgerufen          |
 | Plugin-System           | abstrakte Basisklasse Python    | einheitliche Schnittstelle für Drittanbieter            |
 
-### Warum Polling statt Webhooks
-Der Python Sync Service auf dem Proxmox VPS muss nicht von außen erreichbar sein.
-Er fragt aktiv alle 30 Sekunden bei der FastAPI auf YunoHost nach Änderungen.
-Einfacher, robuster, keine Firewall- oder Port-Forwarding-Anforderungen.
+### Warum FastAPI statt direktem Datenbankzugriff
+Python verbindet sich nicht direkt mit MariaDB (kein offener Port 3306 nötig).
+Stattdessen nutzt Python die FastAPI-Endpunkte auf YunoHost per HTTPS – sowohl
+zum Schreiben als auch zum Lesen. Das hat folgende Vorteile:
+- Kein Datenbankport muss nach außen geöffnet werden
+- FastAPI ist automatisch die Single Source of Truth
+- Schreibvorgänge triggern automatisch WebSocket-Updates ans Dashboard
+- Die REST-API ist selbstdokumentierend (Swagger UI unter `/api/docs`)
+
+### Kein Polling – On-Demand
+Python wird von OpenClaw bei Bedarf aufgerufen (kein dauerhaft laufender Dienst
+auf Proxmox nötig). Für Schreibvorgänge wird Python einmalig mit Daten aufgerufen.
+Für Lesevorgänge wird Python mit einem Lesebefehl aufgerufen und gibt das Ergebnis
+direkt zurück an OpenClaw.
 
 ### Einzelnutzer-System
 Kein Multi-Tenancy. Ein fester Admin-Account. JWT-gesichert.
@@ -101,15 +123,18 @@ Kein Multi-Tenancy. Ein fester Admin-Account. JWT-gesichert.
 │   ├── requirements.txt
 │   └── .env.example
 │
-├── sync-backend/                # Python Sync Service → deployed auf Proxmox VPS
-│   ├── sync/
-│   │   ├── main.py              # Einstieg + Polling-Scheduler
-│   │   ├── receiver.py          # /ingest-Endpoint (empfängt von OpenClaw)
-│   │   ├── db.py                # lokale SQLite-Pufferdatenbank
-│   │   ├── api_client.py        # HTTPS-Client zur FastAPI auf YunoHost
-│   │   └── logger.py
+├── assistant-bridge/            # Python Script → auf Proxmox VPS, von OpenClaw aufgerufen
+│   ├── bridge.py                # Einstiegspunkt (CLI), von OpenClaw direkt aufgerufen
+│   ├── actions/
+│   │   ├── write.py             # Schreiben: POST /api/todos, /api/events, etc.
+│   │   └── read.py              # Lesen: GET /api/todos, /api/reminders, etc.
+│   ├── api_client.py            # HTTPS-Client zur FastAPI (Auth, Retry, Fehlerbehandlung)
+│   ├── formatter.py             # Antwort für OpenClaw aufbereiten (Text/JSON)
+│   ├── config.py                # Konfiguration aus .env laden
+│   ├── logger.py                # Logging
 │   ├── requirements.txt
-│   └── .env.example
+│   ├── .env.example
+│   └── README.md                # Vollständige Dokumentation der Schnittstelle
 │
 ├── dashboard/                   # Next.js Dashboard → deployed auf YunoHost
 │   ├── app/
@@ -344,46 +369,178 @@ Events:
 
 ---
 
-## 7. OpenClaw → Python Sync Service (lokal auf Proxmox)
+## 7. Python-Schnittstelle (Bridge) – vollständige Dokumentation
 
-OpenClaw übergibt strukturierte Daten lokal per HTTP (kein Netzwerk-Exposure).
+Das Python Script `bridge.py` wird von OpenClaw direkt als Subprocess aufgerufen.
+Es ist das einzige Bindeglied zwischen OpenClaw und der Datenbank (via FastAPI).
 
+### Aufruf durch OpenClaw
+
+```bash
+python bridge.py --action <aktion> --type <typ> [--data '<json>'] [--filter '<json>']
 ```
-POST http://localhost:8001/ingest
-Authorization: Bearer <lokaler API-Key aus .env>
-Content-Type: application/json
+
+| Parameter  | Beschreibung                                         |
+|------------|------------------------------------------------------|
+| `--action` | `write` oder `read`                                  |
+| `--type`   | Objekttyp: `todo`, `event`, `idea`, `shopping_item`, `reminder` |
+| `--data`   | JSON-String mit den Daten (nur bei `write`)          |
+| `--filter` | JSON-String mit Filterkriterien (nur bei `read`)     |
+
+### Schreiben (write)
+
+**Neues Todo:**
+```bash
+python bridge.py --action write --type todo \
+  --data '{"title": "Zahnarzt anrufen", "due_date": "2026-04-10", "priority": 1}'
 ```
 
-Payload-Beispiele:
+**Neue Idee (aus Sprachnachricht):**
+```bash
+python bridge.py --action write --type idea \
+  --data '{"title": "App-Idee", "content": "...", "source": "audio"}'
+```
+
+**Neuer Termin:**
+```bash
+python bridge.py --action write --type event \
+  --data '{"title": "Meeting mit Max", "start_time": "2026-04-05T14:00:00"}'
+```
+
+**Einkaufsartikel:**
+```bash
+python bridge.py --action write --type shopping_item \
+  --data '{"title": "Milch", "quantity": 2, "unit": "l"}'
+```
+
+**Erinnerung:**
+```bash
+python bridge.py --action write --type reminder \
+  --data '{"type": "todo", "remind_at": "2026-04-05T09:00:00", "channel": "telegram"}'
+```
+
+**Rückgabe (stdout, JSON):**
 ```json
-{ "type": "todo",          "data": { "title": "Zahnarzt anrufen", "due_date": "2026-04-10" } }
-{ "type": "idea",          "data": { "title": "App-Idee", "content": "...", "source": "audio" } }
-{ "type": "event",         "data": { "title": "Meeting", "start_time": "2026-04-05T14:00:00Z" } }
-{ "type": "shopping_item", "data": { "title": "Milch", "quantity": 2, "unit": "l" } }
-{ "type": "reminder",      "data": { "target_ref": "<uuid>", "remind_at": "...", "channel": "telegram" } }
+{ "success": true, "id": "a1b2c3d4-...", "message": "Todo erstellt" }
 ```
-
-Python puffert eingehende Daten in lokaler SQLite und sendet sie anschließend
-per HTTPS an die FastAPI auf YunoHost.
 
 ---
 
-## 8. Sync-Strategie (Polling, Proxmox → YunoHost)
+### Lesen (read)
 
-```
-Python Sync Service (Proxmox)        FastAPI (YunoHost)
-           │                               │
-           │── POST /api/todos ───────────►│  neue Daten pushen (HTTPS)
-           │                               │
-           │── GET /api/changes?since= ───►│  Änderungen abholen (alle 30 Sek.)
-           │◄── [{ id, type, data, ... }] ─│
-           │                               │
-           │  lokale SQLite aktualisieren  │
+**Alle offenen Todos:**
+```bash
+python bridge.py --action read --type todo \
+  --filter '{"completed": false}'
 ```
 
-- `last_sync_at`-Timestamp wird lokal in SQLite gespeichert
-- Bei Verbindungsfehler: exponential backoff (5s → 10s → 20s → max 5 Min)
-- SQLite puffert Daten bei Offline-Phasen, sendet nach Wiederverbindung nach
+**Heutige Termine:**
+```bash
+python bridge.py --action read --type event \
+  --filter '{"date": "today"}'
+```
+
+**Einkaufsliste (nicht abgehakt):**
+```bash
+python bridge.py --action read --type shopping_item \
+  --filter '{"checked": false}'
+```
+
+**Alle Ideen:**
+```bash
+python bridge.py --action read --type idea \
+  --filter '{}'
+```
+
+**Rückgabe (stdout, JSON):**
+```json
+{
+  "success": true,
+  "count": 3,
+  "items": [
+    { "id": "...", "title": "Zahnarzt anrufen", "due_date": "2026-04-10", "priority": 1, "completed": false },
+    { "id": "...", "title": "Einkaufen", "due_date": null, "priority": 2, "completed": false },
+    { "id": "...", "title": "Auto zum TÜV", "due_date": "2026-04-15", "priority": 1, "completed": false }
+  ]
+}
+```
+
+**Zusätzlich als lesbarer Text** (über `--format text`):
+```bash
+python bridge.py --action read --type todo --filter '{"completed": false}' --format text
+```
+Ausgabe:
+```
+3 offene Todos:
+1. Zahnarzt anrufen (fällig: 10.04.2026, Priorität: hoch)
+2. Einkaufen (keine Fälligkeit)
+3. Auto zum TÜV (fällig: 15.04.2026, Priorität: hoch)
+```
+
+---
+
+### Aktualisieren (update)
+
+**Todo abhaken:**
+```bash
+python bridge.py --action update --type todo \
+  --id "a1b2c3d4-..." --data '{"completed": true}'
+```
+
+**Rückgabe:**
+```json
+{ "success": true, "id": "a1b2c3d4-...", "message": "Todo aktualisiert" }
+```
+
+---
+
+### Fehlerbehandlung
+
+Bei Verbindungsfehlern oder API-Fehler gibt Python einen klaren Fehler aus:
+```json
+{ "success": false, "error": "API nicht erreichbar", "code": 503 }
+```
+Exit-Code ist `1` bei Fehler, `0` bei Erfolg. OpenClaw kann damit umgehen.
+
+---
+
+### Konfiguration (.env auf Proxmox)
+
+```env
+MIDDLEWARE_URL=https://assistant.yourdomain.tld
+MIDDLEWARE_TOKEN=<JWT-Token mit Rolle sync-service>
+LOG_LEVEL=INFO
+LOG_FILE=/var/log/assistant-bridge.log
+```
+
+Der JWT-Token wird einmalig über das Dashboard generiert und in der `.env`
+gespeichert. Er muss bei Ablauf erneuert werden (oder Refresh-Token-Logik).
+
+---
+
+## 8. Datenbankzugriff (Python → FastAPI → MariaDB)
+
+```
+OpenClaw (Proxmox)      Python bridge.py         FastAPI (YunoHost)      MariaDB
+      │                        │                        │                    │
+      │── write todo ─────────►│                        │                    │
+      │                        │── POST /api/todos ─────►│                    │
+      │                        │                        │── INSERT ──────────►│
+      │                        │                        │◄── OK ─────────────│
+      │                        │◄── { id, success } ───│                    │
+      │◄── Bestätigung ────────│                        │                    │
+      │                        │                        │                    │
+      │── was sind meine Todos►│                        │                    │
+      │                        │── GET /api/todos ──────►│                    │
+      │                        │                        │── SELECT ──────────►│
+      │                        │                        │◄── [ ... ] ────────│
+      │                        │◄── JSON Liste ─────────│                    │
+      │◄── formatierter Text ──│                        │                    │
+```
+
+- Kein offener Port 3306 nötig – alles über HTTPS (Port 443)
+- FastAPI ist Single Point of Truth für alle Datenzugriffe
+- Schreibvorgänge triggern automatisch WebSocket-Updates ans Dashboard
 
 ---
 
@@ -535,32 +692,29 @@ location / {
 - DB-Migrationen: `alembic upgrade head`
 - YunoHost SSO wird **nicht** genutzt (eigener JWT-Login)
 
-### Proxmox VPS (Python Sync Service)
+### Proxmox VPS (Python Bridge)
 
-**systemd: Python Sync** (`/etc/systemd/system/assistant-sync.service`)
-```ini
-[Unit]
-Description=Assistant Python Sync Service
-After=network.target
+Das Python Script läuft **nicht** als dauerhafter Service – es wird von OpenClaw
+bei Bedarf als Subprocess aufgerufen und beendet sich nach der Ausführung.
 
-[Service]
-User=openclaw                     # oder passender User
-WorkingDirectory=/opt/assistant-sync
-EnvironmentFile=/opt/assistant-sync/.env
-ExecStart=/opt/assistant-sync/venv/bin/python -m sync.main
-Restart=always
-
-[Install]
-WantedBy=multi-user.target
+**Installation:**
+```bash
+cd /opt/assistant-bridge
+python -m venv venv
+venv/bin/pip install -r requirements.txt
+cp .env.example .env
+# .env mit MIDDLEWARE_URL und MIDDLEWARE_TOKEN befüllen
 ```
 
-**.env auf Proxmox:**
-```env
-LOCAL_API_KEY=<zufälliger Key, den OpenClaw beim POST mitschickt>
-MIDDLEWARE_URL=https://assistant.yourdomain.tld/api
-MIDDLEWARE_TOKEN=<JWT sync-service Token>
-SQLITE_PATH=/opt/assistant-sync/buffer.db
-POLL_INTERVAL=30
+**Test (manuell):**
+```bash
+cd /opt/assistant-bridge
+venv/bin/python bridge.py --action read --type todo --filter '{"completed": false}'
+```
+
+**OpenClaw ruft Python so auf** (Beispiel-Konfiguration in OpenClaw):
+```
+/opt/assistant-bridge/venv/bin/python /opt/assistant-bridge/bridge.py --action write --type todo --data '...'
 ```
 
 ---
@@ -573,12 +727,13 @@ POLL_INTERVAL=30
 3. Next.js-Dashboard: Login, Übersicht, alle Listenansichten, WebSocket
 4. systemd-Units + nginx-Snippet einrichten, HTTPS testen
 
-### Phase 2 – Proxmox: Python Sync Service
-1. `/ingest`-Endpoint aufbauen (OpenClaw übergibt hier)
-2. SQLite-Puffer für Offline-Phasen
-3. HTTPS-Client zur FastAPI auf YunoHost (mit exponential backoff)
-4. Polling-Scheduler (30 Sek.) für bidirektionalen Sync
-5. systemd-Unit auf Proxmox einrichten
+### Phase 2 – Proxmox: Python Bridge
+1. `bridge.py` CLI-Interface (`--action write/read/update`, `--type`, `--data`, `--filter`)
+2. `api_client.py`: HTTPS-Client zur FastAPI (Bearer Token, Retry, Fehlerbehandlung)
+3. `actions/write.py`: alle Objekttypen schreiben
+4. `actions/read.py`: alle Objekttypen lesen + Filterlogik
+5. `formatter.py`: Ausgabe als JSON und als lesbaren Text für OpenClaw
+6. Vollständige `README.md` mit Beispielaufrufen für OpenClaw-Integration
 
 ### Phase 3 – Plugins
 1. Todoist-Plugin
@@ -602,10 +757,10 @@ POLL_INTERVAL=30
 | Datenbank                           | MariaDB auf YunoHost (bereits vorhanden)                |
 | Dashboard + API-Server              | YunoHost                                                |
 | Assistent                           | OpenClaw (auf Proxmox VPS, bereits vorhanden)           |
-| Python Sync Service                 | auf Proxmox VPS, neben OpenClaw                         |
-| OpenClaw → Python Kommunikation     | HTTP POST localhost:8001 (lokal, kein Netzwerk)         |
-| Python → FastAPI Kommunikation      | HTTPS (öffentlich, JWT-gesichert)                       |
-| Webhook vs. Polling                 | **Polling** (30 Sek.) – Proxmox muss nicht erreichbar sein |
+| Python Bridge                       | auf Proxmox VPS, neben OpenClaw                         |
+| OpenClaw → Python                   | direkter Subprocess-Aufruf (CLI mit Argumenten)         |
+| Python → FastAPI                    | HTTPS REST – lesen (GET) + schreiben (POST/PATCH)       |
+| Sync-Strategie                      | On-Demand, kein dauerhafter Dienst auf Proxmox          |
 | Konfliktlösung                      | Server-wins + Audit-Log                                 |
 | Anzahl Nutzer                       | **Einzelnutzer** – kein Multi-Tenancy                   |
 
@@ -614,7 +769,7 @@ POLL_INTERVAL=30
 ## 15. Fazit
 
 ```
-OpenClaw (Proxmox)   →   Python Sync Service (Proxmox)
+OpenClaw (Proxmox)   →   Python Bridge (Proxmox)
                                │ HTTPS
                          FastAPI + MariaDB (YunoHost)
                                │ WebSocket
