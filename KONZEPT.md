@@ -620,9 +620,10 @@ globalen State ohne Seiten-Reload.
 
 ## 12. Deployment
 
-### YunoHost (Dashboard + FastAPI + MariaDB)
+### YunoHost
 
-YunoHost bringt mit: nginx, MariaDB, Let's Encrypt SSL, systemd.
+YunoHost bringt mit: nginx, MariaDB, Let's Encrypt SSL, Python.
+**Keine manuellen systemd-Units oder nginx-Konfigurationen nötig.**
 
 **MariaDB einrichten (einmalig):**
 ```sql
@@ -632,65 +633,38 @@ GRANT ALL PRIVILEGES ON assistant_db.* TO 'assistant'@'localhost';
 FLUSH PRIVILEGES;
 ```
 
-**systemd: FastAPI** (`/etc/systemd/system/assistant-api.service`)
-```ini
-[Unit]
-Description=Assistant FastAPI
-After=network.target mariadb.service
+**FastAPI – Standard Python-App auf YunoHost:**
+```bash
+cd /opt/assistant/middleware
+python3 -m venv venv
+venv/bin/pip install -r requirements.txt
+cp .env.example .env        # .env befüllen
+venv/bin/alembic upgrade head   # DB-Schema anlegen
+venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 8000
+```
+YunoHost's nginx proxied die Anfragen automatisch.
 
-[Service]
-User=www-data
-WorkingDirectory=/opt/assistant/middleware
-EnvironmentFile=/opt/assistant/middleware/.env
-ExecStart=/opt/assistant/venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 8000
-Restart=always
+**Dashboard – Next.js statischer Export → "My Webapp" (Custom App):**
 
-[Install]
-WantedBy=multi-user.target
+Das Dashboard wird als statische Dateien gebaut (kein Node.js-Server nötig):
+```bash
+cd dashboard
+npm install
+npm run build   # erzeugt /out Verzeichnis
+```
+Die Dateien aus `/out` werden in das von "My Webapp" erstellte Verzeichnis kopiert
+(z. B. `/var/www/myapp/`). YunoHost serviert sie direkt via nginx.
+
+```js
+// next.config.js – statischer Export
+const nextConfig = { output: 'export', trailingSlash: true }
 ```
 
-**systemd: Next.js** (`/etc/systemd/system/assistant-dashboard.service`)
-```ini
-[Unit]
-Description=Assistant Dashboard
-After=network.target
+Das Dashboard verbindet sich per WebSocket direkt mit der FastAPI:
+`wss://assistant-api.yourdomain.tld/ws?token=<token>`
 
-[Service]
-User=www-data
-WorkingDirectory=/opt/assistant/dashboard
-ExecStart=/usr/bin/node server.js
-Restart=always
-Environment=NODE_ENV=production PORT=3000
-
-[Install]
-WantedBy=multi-user.target
-```
-
-**nginx-Snippet** (`/etc/nginx/conf.d/assistant.conf`):
-```nginx
-location /api/ {
-    proxy_pass http://127.0.0.1:8000;
-    proxy_set_header Host $host;
-    proxy_set_header X-Real-IP $remote_addr;
-}
-
-location /ws {
-    proxy_pass http://127.0.0.1:8000;
-    proxy_http_version 1.1;
-    proxy_set_header Upgrade $http_upgrade;
-    proxy_set_header Connection "upgrade";
-    proxy_set_header Host $host;
-}
-
-location / {
-    proxy_pass http://127.0.0.1:3000;
-    proxy_set_header Host $host;
-}
-```
-
-- SSL: von YunoHost automatisch via Let's Encrypt
-- DB-Migrationen: `alembic upgrade head`
-- YunoHost SSO wird **nicht** genutzt (eigener JWT-Login)
+- SSL: von YunoHost via Let's Encrypt automatisch
+- YunoHost SSO wird **nicht** genutzt – eigener JWT-Login
 
 ### Proxmox VPS (Python Bridge)
 
@@ -722,10 +696,10 @@ venv/bin/python bridge.py --action read --type todo --filter '{"completed": fals
 ## 13. Umsetzungsplan (Phasen)
 
 ### Phase 1 – YunoHost: Middleware + Dashboard
-1. MariaDB-Datenbank anlegen + Alembic-Schema einrichten
-2. FastAPI aufbauen: Auth (JWT), CRUD alle Objekte, WebSocket, `/changes`-Endpoint
-3. Next.js-Dashboard: Login, Übersicht, alle Listenansichten, WebSocket
-4. systemd-Units + nginx-Snippet einrichten, HTTPS testen
+1. MariaDB-Datenbank anlegen (einmaliger SQL-Befehl)
+2. FastAPI aufbauen: Auth (JWT), CRUD alle Objekte, WebSocket, `/changes`-Endpunkt
+3. Next.js-Dashboard als **statischer Export**: Login, Übersicht, alle Listenansichten, WebSocket
+4. FastAPI auf YunoHost starten, Dashboard-Dateien in "My Webapp" deployen
 
 ### Phase 2 – Proxmox: Python Bridge
 1. `bridge.py` CLI-Interface (`--action write/read/update`, `--type`, `--data`, `--filter`)
@@ -755,7 +729,8 @@ venv/bin/python bridge.py --action read --type todo --filter '{"completed": fals
 | Frage                               | Entscheidung                                            |
 |-------------------------------------|---------------------------------------------------------|
 | Datenbank                           | MariaDB auf YunoHost (bereits vorhanden)                |
-| Dashboard + API-Server              | YunoHost                                                |
+| FastAPI + MariaDB                   | YunoHost (Standard Python-App)                          |
+| Dashboard                           | YunoHost "My Webapp" (statischer Next.js Export)        |
 | Assistent                           | OpenClaw (auf Proxmox VPS, bereits vorhanden)           |
 | Python Bridge                       | auf Proxmox VPS, neben OpenClaw                         |
 | OpenClaw → Python                   | direkter Subprocess-Aufruf (CLI mit Argumenten)         |
